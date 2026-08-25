@@ -1,0 +1,300 @@
+Gathering the SQL schema and any documentation so the Spring Boot design matches your current ERP domain.
+
+Read [](file:///d%3A/Projects/erp/erp/diigoo-erp/db/migrations/0001_init.sql)
+
+## Spring Boot backend design for your ERP
+
+You can map the existing Rust core design to a Spring Boot backend cleanly by keeping the same modular domain structure, multi-tenant DB model, and JWT/RBAC approach.
+
+---
+
+## 1. Overall architecture
+
+Use a Spring Boot application with modular packages or Maven modules:
+
+- `core` / `app` — main Spring Boot service
+- `shared` — common config, security, tenant context, error handling
+- `auth` — authentication + user profile
+- `hrm` — HR domain
+- `crm` — CRM domain
+- `platform` — optional shared platform services, modules registry, health
+
+This mirrors your current architecture:
+- gateway → Spring Boot app
+- shared → shared package
+- auth/hrm/crm crates → separate packages or submodules
+
+---
+
+## 2. Recommended package structure
+
+```
+src/main/java/com/diigoo/erp
+  config
+  security
+  tenant
+  auth
+    controller
+    service
+    repository
+    dto
+    entity
+  hrm
+    controller
+    service
+    repository
+    dto
+    entity
+  crm
+    controller
+    service
+    repository
+    dto
+    entity
+  platform
+    controller
+    service
+    dto
+```
+
+For a multi-module Maven build:
+- `diigoo-erp-core`
+- `diigoo-erp-auth`
+- `diigoo-erp-hrm`
+- `diigoo-erp-crm`
+- `diigoo-erp-shared`
+
+---
+
+## 3. Database strategy
+
+### Use PostgreSQL + Flyway
+- `src/main/resources/db/migration/V1__init.sql`
+- port your existing SQL schema into Flyway migration scripts
+- keep the existing tables:
+  - `tenants`
+  - `users`
+  - `hr_locations`
+  - `hr_departments`
+  - `hr_positions`
+  - `hr_employees`
+  - `hr_leave_requests`
+  - `hr_requisitions`
+
+### Multi-tenancy
+Keep the same RLS model:
+- PostgreSQL `app.current_tenant`
+- policy on tenant-scoped tables
+- `diigoo_app` DB role
+
+In Spring Boot, set the tenant before each request:
+- `OncePerRequestFilter` reads tenant from JWT
+- set `CURRENT_SETTING('app.current_tenant')` on every DB connection
+- use a connection proxy or `DataSource` wrapper
+
+Example flow:
+1. Request arrives
+2. JWT validated
+3. Tenant id extracted
+4. `TenantContext.setCurrentTenant(tenantId)`
+5. SQL connection executes:
+   ```
+   SELECT set_config('app.current_tenant', ?, false)
+   ```
+6. RLS applies automatically
+
+---
+
+## 4. Security design
+
+### JWT authentication
+- `/api/v1/auth/login`
+- `/api/v1/auth/me`
+
+JWT claims:
+- `sub` = user id
+- `tid` = tenant id
+- `role`
+- `eid` = employee id
+- `iss` = issuer
+
+### Spring Security
+- `JwtAuthenticationFilter`
+- `JwtTokenProvider`
+- `UserDetailsService` loads from `users`
+- `PasswordEncoder` = `BCryptPasswordEncoder`
+
+### RBAC
+Implement a service like:
+- `AuthorizationService.can(role, action, module)`
+
+Define:
+- `Action { CREATE, READ, UPDATE, DELETE, APPROVE, OPERATE, EXPORT }`
+- `Module { HR, SALES_CRM, FINANCE, AI_ANALYTICS, SYSTEM_ADMIN, INTEGRATIONS }`
+
+Use either:
+- explicit service checks inside controllers/services
+- or `@PreAuthorize` with custom role evaluator
+
+Example:
+- HR analytics: require `READ` on `HR`
+- employee creation: require `CREATE` on `HR`
+- leave approval: require special roles like `HR_MANAGER`, `OWNER`, `ACCOUNTANT`
+
+---
+
+## 5. API design
+
+### Auth
+- `POST /api/v1/auth/login`
+- `GET /api/v1/auth/me`
+
+### HRM
+- `GET /api/v1/employees`
+- `POST /api/v1/employees`
+- `GET /api/v1/employees/{id}`
+- `GET /api/v1/analytics/hr`
+- `GET /api/v1/leave-requests`
+- `POST /api/v1/leave-requests`
+- `PATCH /api/v1/leave-requests/{id}`
+
+### CRM
+Start with:
+- `GET /api/v1/crm/info`
+Then expand to:
+- `GET /api/v1/crm/customers`
+- `POST /api/v1/crm/leads`
+- `GET /api/v1/crm/opportunities`
+
+This keeps the same endpoint shape used by the current Next.js frontend.
+
+---
+
+## 6. Domain model mapping
+
+### HR entities
+- `Tenant`
+- `User`
+- `Employee`
+- `Location`
+- `Department`
+- `Position`
+- `LeaveRequest`
+- `Requisition`
+
+### Example entity mapping
+`hr_employees` → `Employee`
+- `id`
+- `tenantId`
+- `employeeNo`
+- `firstName`
+- `lastName`
+- `email`
+- `phone`
+- `status`
+- `employmentType`
+- `positionId`
+- `departmentId`
+- `locationId`
+- `managerId`
+- `hireDate`
+- `terminationDate`
+
+`hr_leave_requests` → `LeaveRequest`
+- `policyId`
+- `policyName`
+- `startDate`
+- `endDate`
+- `days`
+- `reason`
+- `status`
+- `requestedAt`
+- `decidedBy`
+- `decidedAt`
+
+---
+
+## 7. Service layer design
+
+For each module:
+- Controller: HTTP API, request validation
+- Service: business rules, RBAC decisions, orchestration
+- Repository: database access
+- DTO: request/response models
+
+Example `hrm` service responsibilities:
+- employee search/pagination
+- create employee
+- get employee detail
+- request leave
+- approve/reject leave
+- HR analytics aggregation
+
+---
+
+## 8. Recommended Spring Boot technologies
+
+- Spring Boot 3.x
+- Spring Security
+- Spring Data JPA or Spring JDBC
+- Flyway for DB migrations
+- PostgreSQL driver
+- Lombok (optional)
+- MapStruct or manual DTO mapping
+- Spring Validation (`@Valid`)
+
+---
+
+## 9. Integration with your frontend
+
+Your current frontend is already wired to:
+- `CORE_API_URL`
+- `DATA_ADAPTER=core`
+
+Keep the same contract:
+- frontend calls `/api/v1/*`
+- backend returns JSON envelopes
+- authentication via `Authorization: Bearer <token>`
+
+---
+
+## 10. Next concrete step
+
+If you want, I can now give you:
+1. a Spring Boot module/package skeleton
+2. `application.yml` config for `postgres`, `jwt`, and `tenant`
+3. a sample `SecurityConfig` class
+4. entity + repository + controller templates for HRM
+5. the Flyway migration plan that ports your existing SQL
+
+10:57 31-07-2026
+Rust’s purpose is to be a systems programming language that combines the performance of C/C++ with the safety and modern features of higher-level languages. It was designed to eliminate entire classes of bugs (like memory corruption and data races)
+
+Systems programming: Operating systems, device drivers.
+
+WebAssembly: Running safe, fast code in browsers.
+
+Backend development: APIs, microservices, high-performance servers.
+
+Embedded systems: IoT devices, robotics.
+
+AI/ML: Growing ecosystem for inference and model deployment.
+
+Game engines: Performance-critical rendering and physics.
+
+Ownership and borrows
+
+let data = String::from("hello");
+let a = &data;          // immutable borrow (reader 1)
+let b = &data;          // immutable borrow (reader 2)
+println!("{a} and {b}");
+Rust allows any number of immutable borrows at the same time, because they are read-only.
+
+fn main()
+{
+   let data = String::from("hello");
+   let s1 = data;
+   let s2 = data;
+   println!("{} and {}", s1, s2); 
+}
+error[E0382]: borrow of moved value: `data`
